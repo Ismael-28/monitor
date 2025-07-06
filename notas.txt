@@ -1,0 +1,19 @@
+23 junio
+
+La tarjeta integrada funciona mejor con el valor por defecto, mientras que la tarjeta alfa parece comportarse al revés.
+Hay que conseguir que funcionen las gráficas.
+
+1 julio
+
+ahora parece que las tarjetas alfa tambien van mejor con el valor por defecto, y a priori tener el v no afecta mucho (yo no entiendo nada).
+
+3 julio
+
+Hay que desacoplar la recolección de datos de la actualización de las gráficas.
+Primero he intentado crear una serie de clases que ejecuten su propio hilo para que cada uno recoja su métrica, pero parece complicado.
+He desistido y en su lugar he creado un hilo aparete en la gráfica que se encargue unicamente de recolectar las muestras e imprimirlas.
+
+4 julio
+
+Me he dado cuenta de que hay una desincronización importante entre el muestreo y la impresión por pantalla, así que he retomado las
+clases que lanzan su propio hilo en data_collector, y parece que funcionan.

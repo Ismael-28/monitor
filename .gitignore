@@ -1,0 +1,20 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+
+# Entornos virtuales
+env/
+venv/
+.venv/
+
+# Variables de entorno (ejemplo .env)
+.env
+
+# Archivos temporales de sistema
+.DS_Store
+Thumbs.db
+
+capturas/
+datos_graficas/
+graficas/
+logs/
