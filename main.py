@@ -14,7 +14,7 @@ from utils import get_interface_display_name
 from theme import console
 import system_utils
 import ui
-from plotting_collector_2 import RealTimePlot, MATPLOTLIB_AVAILABLE
+from plotting import RealTimePlot, MATPLOTLIB_AVAILABLE
 
 app = typer.Typer(add_completion=False)
 

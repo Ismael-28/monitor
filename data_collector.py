@@ -301,10 +301,10 @@ class DataCollector(BaseCollector):
         self._last_elapsed = sample.elapsed
 
         row = (
-            f"[cyan]{ts_fmt:<14}[/cyan]| "
-            f"[magenta]{sample.ap_name:<19}[/magenta]"
-            f"[gold1]{elapsed:<12}[/gold1]"
-            f"[aquamarine1]{delta:<12}[/aquamarine1]"
+            f"[timestamp]{ts_fmt:<14}[/timestamp]| "
+            f"[ap]{sample.ap_name:<19}[/ap]"
+            f"[time]{elapsed:<12}[/time]"
+            f"[delta]{delta:<12}[/delta]"
             f"{format_stat(sample.rssi,   '{:.0f}', ' dBm',   'rssi',    12)}"
             f"{format_stat(sample.latency,'{:.3f}', ' ms',    'latency', 14)}"
             f"{format_stat(sample.jitter, '{:.3f}', ' ms',    'jitter',  14)}"
@@ -328,6 +328,8 @@ class DataCollector(BaseCollector):
                 self.all_samples.append(sample)
                 self.sample_queue.put(sample)
             time.sleep(self.interval)
+        else:
+            console.print("[warn]Hilo de recolección detenido.[/warn]")
 
     def start(self) -> None:
         """Inicia todos los hilos de recolección."""
@@ -339,10 +341,10 @@ class DataCollector(BaseCollector):
         super().start() # Inicia el hilo de agregación de DataCollector
 
         header = (
-            f"[cyan]{'Hora':<14}[/cyan]| "
-            f"[magenta]{'AP':<19}[/magenta]"
-            f"[gold1]{'Tiempo':<12}[/gold1]"
-            f"[aquamarine1]{'ΔTiempo':<12}[/aquamarine1]"
+            f"[timestamp]{'Hora':<14}[/timestamp]| "
+            f"[ap]{'AP':<19}[/ap]"
+            f"[time]{'Tiempo':<12}[/time]"
+            f"[delta]{'ΔTiempo':<12}[/delta]"
             f"[rssi]{'RSSI':<12}[/rssi]"
             f"[latency]{'Latencia':<14}[/latency]"
             f"[jitter]{'Jitter':<14}[/jitter]"
@@ -353,10 +355,9 @@ class DataCollector(BaseCollector):
         
     def stop(self) -> None:
         """Detiene todos los hilos de recolección."""
-        console.print("[info]Deteniendo todos los colectores...[/info]")
+        super().stop() # Detiene el hilo de agregación
         for collector in self.collectors:
             collector.stop()
-        super().stop() # Detiene el hilo de agregación
         time.sleep(0.5)  # Espera a que se detenga el hilo de muestreo
         self.print_summary()  # Muestra el resumen final
 

@@ -19,6 +19,11 @@ class AppTheme:
     jitter: str = "deep_pink4"
     loss: str  = "dark_orange3"
 
+    timestamp: str = "cyan"
+    ap: str = "magenta"
+    time: str = "gold1"
+    delta: str = "aquamarine1"
+
     def rich_theme(self) -> Theme:
         return Theme({
             "info":        self.info,
@@ -35,6 +40,10 @@ class AppTheme:
             "latency_mean":f"bold underline {self.latency}",
             "jitter_mean": f"bold underline {self.jitter}",
             "loss_mean":   f"bold underline {self.loss}",
+            "timestamp":   self.timestamp,
+            "ap":          self.ap,
+            "time":        self.time,
+            "delta":       self.delta,
         })
 
 APP_THEME = AppTheme()
