@@ -20,6 +20,7 @@ INTERFACE_MAP: Dict[str, str] = {
     "wlp0s20f3": "Intel",
     "wlx00c0cab2bc1a": "Alfa_1",
     "wlx00c0cab2bc2c": "Alfa_2",
+    "wlx00c0cab3c2de": "Alfa_3",
 }
 
 PLOT_CONFIG: Dict[str, PlotConfig] = {
@@ -48,7 +49,7 @@ PLOT_CONFIG: Dict[str, PlotConfig] = {
         ax_key='ax_loss',
         title="Tasa de Pérdidas",
         ylabel="Pérdidas (%)",
-        color="coral",
-        legend_edge_color='coral'
+        color="blueviolet",
+        legend_edge_color='blueviolet'
     )
 }

@@ -3,10 +3,13 @@
 """
 Script principal para monitorizar la señal Wi-Fi (RSSI) y el Punto de Acceso (AP).
 
-También permite la captura de paquetes con TShark en una interfaz en modo monitor.
+También permite la captura de paquetes con TShark en una interfaz en modo monitor,
+y alinea automáticamente el canal de la interfaz de monitor con el de la interfaz gestionada.
 """
 
 import os
+import subprocess
+import time
 from datetime import datetime
 from typing import Optional
 import typer
@@ -36,6 +39,41 @@ def setup_logging(interface_name: str, name: Optional[str]) -> Optional[object]:
     except IOError as e:
         console.print(f"[error]Error al abrir el archivo de log: {e}[/error]")
         return None
+
+
+def get_interface_channel(interface: str) -> Optional[int]:
+    """Devuelve el canal actual de la interfaz (o None si falla)."""
+    try:
+        out = subprocess.check_output(
+            ["iw", "dev", interface, "info"],
+            stderr=subprocess.DEVNULL,
+            text=True
+        )
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("channel"):
+                parts = line.split()
+                # formato: "channel 36 (5180 MHz)"
+                if len(parts) >= 2 and parts[1].isdigit():
+                    return int(parts[1])
+    except Exception:
+        pass
+    return None
+
+
+def set_interface_channel(interface: str, channel: int) -> bool:
+    """Intenta cambiar el canal de la interfaz; devuelve True si tuvo éxito."""
+    try:
+        subprocess.run(
+            ["sudo", "iw", "dev", interface, "set", "channel", str(channel)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        return True
+    except subprocess.CalledProcessError as e:
+        console.print(f"[error]No se pudo cambiar el canal de {interface} a {channel}: {e}[/error]")
+        return False
 
 
 @app.command()
@@ -68,7 +106,7 @@ def main(
     """Función principal que orquesta la ejecución del script."""
     system_utils.check_dependencies()
 
-    # Selección de interfaz de monitor (Managed)
+    # Selección de interfaz gestionada (Managed)
     mon_iface = interface or ui.select_interface_dialog(mode='Managed')
     if not mon_iface:
         console.print("[error]No se seleccionó una interfaz de monitorización. Saliendo.[/error]")
@@ -80,6 +118,28 @@ def main(
         if capture_interface is not None
         else ui.select_interface_dialog(mode='Monitor')
     )
+
+    # Alineación de canal: si ambas interfaces existen, comprobamos y sincronizamos
+    if capture_iface:
+        managed_chan = get_interface_channel(mon_iface)
+        monitor_chan = get_interface_channel(capture_iface)
+
+        console.print("")
+
+        if managed_chan is None:
+            console.print(f"[warning]No se pudo obtener el canal de {mon_iface}[/warning]")
+        if monitor_chan is None:
+            console.print(f"[warning]No se pudo obtener el canal de {capture_iface}[/warning]")
+
+        if managed_chan and monitor_chan and managed_chan != monitor_chan:
+            console.print(f"[warn]Cambiando canal de {capture_iface} de {monitor_chan} -> {managed_chan}[/]")
+            if set_interface_channel(capture_iface, managed_chan):
+                # Pequeña espera para que la interfaz realice el cambio
+                time.sleep(0.5)
+                console.print(f"[success]{capture_iface} ahora en canal {managed_chan}[/success]")
+            else:
+                console.print(f"[error]No se pudo alinear el canal de {capture_iface}[/error]")
+            console.print("")
 
     log_file = setup_logging(mon_iface, name) if log else None
 

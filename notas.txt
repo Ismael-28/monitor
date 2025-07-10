@@ -17,3 +17,14 @@ He desistido y en su lugar he creado un hilo aparete en la gráfica que se encar
 
 Me he dado cuenta de que hay una desincronización importante entre el muestreo y la impresión por pantalla, así que he retomado las
 clases que lanzan su propio hilo en data_collector, y parece que funcionan.
+
+8 julio
+
+Hace falta especificar la interfaz usada en el ping y el iperf porque sino salen cosas extrañas.
+Alfa 2 parece funcionar mejor con -120 bgm, al contrario que alfa 1
+
+10 julio
+
+Alfa 3 va raro, parece que necesita el bluetooth para funcionar.
+Alfa 1 parece que tiene un valor de bgscan distinto por defecto, aunque ha cambiado al reiniciar el equipo.
+Con ALfa 3 el iperf parece fallar de vez en cuando, no se a que se debe

@@ -17,7 +17,7 @@ class AppTheme:
     rssi: str = "green1"
     latency: str = "cornflower_blue"
     jitter: str = "deep_pink4"
-    loss: str  = "dark_orange3"
+    loss: str  = "blue_violet"
 
     timestamp: str = "cyan"
     ap: str = "magenta"

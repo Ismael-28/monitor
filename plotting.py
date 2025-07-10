@@ -74,15 +74,43 @@ def _draw_ap_change_annotations(ax: Axes, ap_changes: List[APChange]):
     # NO borres nada aquí, porque solo dibujarás cada cambio una vez
     y_min, y_max = ax.get_ylim()
     text_y = y_min + (y_max - y_min) * 0.05
+    offset = (ax.get_xlim()[1] - ax.get_xlim()[0]) * 0.01  # 1% del ancho de la gráfica
     for change in ap_changes:
+        # Detectamos desconexiones (puedes cambiar la condición según tu modelo)
+        is_disconnect = 'desconect' in change.name.lower()
+        line_color = 'orange' if is_disconnect else 'red'
+        box_color  = 'darkorange' if is_disconnect else 'red'
+        if is_disconnect:
+            text_x = change.time - offset
+            ha = 'right'
+        else:
+            text_x = change.time + offset
+            ha = 'left' 
+
+        # Línea vertical
         ax.axvline(
-            x=change.time, color='red', linestyle='--', linewidth=1.5,
+            x=change.time,
+            color=line_color,
+            linestyle='--',
+            linewidth=1.5,
             zorder=0
         )
+        # Etiqueta con fondo diferenciado si es desconexión
         ax.text(
-            change.time + 0.5, text_y, f"->{change.name}", color='white',
-            rotation=90, va='bottom', fontsize=9,
-            bbox=dict(boxstyle='round', fc='red', alpha=0.7, ec='none'),
+            text_x,
+            text_y,
+            change.name,
+            color='white',
+            rotation=90,
+            ha=ha,
+            va='bottom',
+            fontsize=9,
+            bbox=dict(
+                boxstyle='round',
+                fc=box_color,
+                alpha=0.7,
+                ec='none'
+            ),
             zorder=10
         )
 
@@ -172,7 +200,7 @@ def generate_final_plot(
                 edgecolor=edge_color, labelcolor='white'
             )
 
-    axes['ax_loss'].set_ylim(bottom=-0.5, top=max(10, axes['ax_loss'].get_ylim()[1]))
+    axes['ax_loss'].set_ylim(bottom=-10, top=100)
     return fig
 
 
@@ -333,9 +361,23 @@ class RealTimePlot:
         self.stop()
 
     def stop(self) -> None:
-        """Detiene la monitorización."""
+        """Detiene la monitorización y recoge las muestras finales pendientes."""
+        # 1. Detener el hilo recolector para que no se añadan más muestras a la cola.
         self.collector.stop()
         console.print("\n[warn]Monitorización detenida.[/warn]")
+
+        # 2. Vaciar la cola de cualquier muestra que haya quedado pendiente.
+        try:
+            while True:
+                # Usamos get_nowait() porque sabemos que no llegarán más muestras.
+                sample = self.collector.sample_queue.get_nowait()
+                self.samples.append(sample)
+        except Empty:
+            # La cola está vacía, que es la condición de salida esperada.
+            pass
+
+        if self.samples:
+            console.print(f"[info]Procesamiento finalizado. Total de muestras recogidas: {len(self.samples)}[/info]")
 
     def save_plot_image(self, new_size: Optional[Tuple[int,int]] = None) -> bool:
         """Guarda la gráfica final como un fichero de imagen PNG."""

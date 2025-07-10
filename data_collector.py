@@ -68,7 +68,7 @@ class BaseCollector(ABC, threading.Thread):
         """
         try:
             # 1) bloqueante: espera hasta timeout (o indefinido) por el primer dato
-            latest_item = self.queue.get(timeout=self.interval)
+            latest_item = self.queue.get(timeout=self.interval*0.2)
         except queue.Empty:
             return None
 
@@ -145,13 +145,16 @@ class LatencyCollector(BaseCollector):
     Colector continuo de latencia usando 'ping -i'.
     """
 
-    def __init__(self, target_ip: str, interval: float = 1.0):
+    def __init__(self, interface: str, target_ip: str, interval: float = 1.0):
         super().__init__(interval)
+        self.interface = interface
         self.target_ip = target_ip
 
     def run(self) -> None:
+        interface_name = 'lo' if self.target_ip == '127.0.0.1' else self.interface
         cmd = [
             'ping',
+            '-I', interface_name,
             '-i', str(self.interval),
             '-s', '1400',
             self.target_ip
@@ -191,29 +194,50 @@ class Iperf3Collector(BaseCollector):
     Ejecuta un cliente iperf3 y recolecta jitter y pérdida de paquetes.
     """
 
-    def __init__(self, server_ip: str, port: int = 5201, interval: float = 1.0):
-        # Iperf3 gestiona su propio intervalo, por lo que el de la clase base no se usa
+    def __init__(
+        self,
+        interface: str,
+        target_ip: str,
+        port: int = 5201,
+        interval: float = 1.0
+    ):
         super().__init__(interval)
-        self.server_ip = server_ip
+        self.interface = interface
+        self.target_ip = target_ip
         self.port = port
         self.proc: Optional[subprocess.Popen] = None
 
     def _parse_line(self, line: str) -> Optional[Tuple[float, float]]:
         """Parse a single iperf3 UDP statistics line."""
-        match = re.search(r"([\d\.]+)\s+ms\s+\d+/\d+\s+\(([0-9\.]+)%\)", line)
-        if match:
-            return float(match.group(1)), float(match.group(2))
-        return None
+        if '0.00 bits/sec' in line:
+            return None
+
+        m = re.search(r"([\d\.]+)\s+ms\s+\d+/\d+\s+\(([0-9.eE+-]+)%\)", line)
+        if not m:
+            return None
+
+        jitter = float(m.group(1))
+        loss = float(m.group(2))
+
+        # luego lo muestras o lo guardas como prefieras
+        return jitter, loss
 
     def run(self) -> None:
         """
         Sobrescribe el método run para gestionar el proceso iperf3.
         El hilo se dedica a leer la salida del subproceso.
         """
+        # Si el target es localhost, fuerza interfaz 'lo'
+        interface_name = 'lo' if self.target_ip == '127.0.0.1' else self.interface
         cmd = [
-            'iperf3', '-c', self.server_ip, '-p', str(self.port),
-            '-u', '-R', '--forceflush', '-b', '10M',
-            '-t', '3600', '-i', str(self.interval)
+            'iperf3',
+            '-c', self.target_ip,
+            '--bind-dev', interface_name,  # <--- fuerza la interfaz de salida
+            '-p', str(self.port),
+            '-u', '-R', '--forceflush',
+            '-b', '10M',
+            '-t', '3600',
+            '-i', str(self.interval)
         ]
         console.print(f"Lanzando: {' '.join(cmd)}")
 
@@ -284,8 +308,8 @@ class DataCollector(BaseCollector):
 
         # Instanciar colectores individuales
         self.rssi = RSSICollector(interface, interval)
-        self.lat = LatencyCollector(target_ip, interval) if target_ip else None
-        self.ipf = Iperf3Collector(target_ip, interval=interval) if target_ip else None
+        self.lat = LatencyCollector(interface, target_ip, interval) if target_ip else None
+        self.ipf = Iperf3Collector(interface, target_ip, interval=interval) if target_ip else None
 
         self.collectors = [
             c for c in [self.rssi, self.lat, self.ipf]
