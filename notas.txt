@@ -27,4 +27,5 @@ Alfa 2 parece funcionar mejor con -120 bgm, al contrario que alfa 1
 
 Alfa 3 va raro, parece que necesita el bluetooth para funcionar.
 Alfa 1 parece que tiene un valor de bgscan distinto por defecto, aunque ha cambiado al reiniciar el equipo.
-Con ALfa 3 el iperf parece fallar de vez en cuando, no se a que se debe
+Con Alfa 3 el iperf parece fallar de vez en cuando, no se a que se debe.
+He disminuido el timeout de la cola porque puede causar falsos tiempos.
