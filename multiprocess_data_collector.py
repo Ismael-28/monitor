@@ -1,43 +1,49 @@
 # -*- coding: utf-8 -*-
 """
-Módulo de monitorización refactorizado.
+Módulo de monitorización refactorizado con multiprocessing.
 
 Este módulo contiene clases dedicadas para recolectar métricas de red
-(RSSI, latencia, iperf3) de forma concurrente. Una clase orquestadora
-'DataCollector' agrega estas métricas en una única cola de muestras.
+(RSSI, latencia, iperf3) de forma concurrente usando procesos separados.
+Una clase orquestadora 'DataCollector' agrega estas métricas en una
+única cola de muestras.
 """
 
-from concurrent.futures import ThreadPoolExecutor
-import queue
+import itertools
+import multiprocessing
 import re
 import signal
 import subprocess
-import threading
 import time
+import netifaces
+import binascii
 from pyroute2 import IPRoute, IW
 from pyroute2.netlink.exceptions import NetlinkError
 from abc import ABC, abstractmethod
 from datetime import datetime
+from queue import Empty  # Usado por multiprocessing.Queue
 from rich.table import Table
 from typing import Any, Dict, List, Optional, Tuple
+
+# Asumimos que estos módulos existen en tu proyecto
 from models import APChange, Sample
 from theme import console
 from config import AP_MAP, PLOT_CONFIG
 from utils import format_stat, write_log_line
 
-class APEventCollector(threading.Thread):
+class APEventCollector(multiprocessing.Process):
     """
     Se suscribe a `iw event -t` para una interfaz específica y reporta
     eventos de escaneo, conexión y desconexión con doble timestamp.
     """
-    def __init__(self, interface: str, event_queue: queue.Queue):
+    def __init__(self, interface: str):
         super().__init__(daemon=True)
         self.interface = interface
         self._stop_event = False
-        self.event_queue = event_queue
+        self.start_time = None # Para registrar el tiempo de inicio
 
     def run(self):
         # Registramos el momento exacto en que el proceso comienza a ejecutarse
+        self.start_time = time.monotonic()
         
         cmd = ['iw', 'event', '-t']
         try:
@@ -69,6 +75,9 @@ class APEventCollector(threading.Thread):
                 ts_iw = datetime.fromtimestamp(float(t_iw_str))
             except (ValueError, IndexError):
                 continue # Si la línea no tiene el formato esperado, la ignoramos
+
+            # Calculamos el tiempo transcurrido desde que se inició el programa
+            elapsed_seconds = time.monotonic() - self.start_time
             
             rest = rest.strip()
             message = ""
@@ -92,7 +101,7 @@ class APEventCollector(threading.Thread):
                 try:
                     # Formato: connect XX:XX:XX:XX:XX:XX auth_type ...
                     bssid = rest.split("connected")[-1].strip().split()[1]
-                    message = f"ESTACIÓN CONECTADA -> {bssid}"
+                    message = f"ESTACIÓN CONECTADA → {bssid}"
                     style = "bold green"
                 except IndexError:
                     continue
@@ -100,7 +109,7 @@ class APEventCollector(threading.Thread):
                 try:
                      # Formato: del station XX:XX:XX:XX:XX:XX
                     bssid = rest.split("del station")[-1].strip().split()[0]
-                    message = f"ESTACIÓN BORRADA   -> {bssid}"
+                    message = f"ESTACIÓN BORRADA   → {bssid}"
                     style = "yellow"
                 except IndexError:
                     continue
@@ -108,10 +117,12 @@ class APEventCollector(threading.Thread):
             # Si hemos identificado un evento, lo mostramos
             tiemstamp = ts_iw.strftime("%H:%M:%S.%f")[:-3]  # Formato HH:MM:SS.sss
             if message:
-                self.event_queue.put({
-                    "ts": ts_iw,
-                    "msg": message
-                })
+                console.print(
+                    f"[{style}]"
+                    f"{tiemstamp} " # Timestamp de 'iw'
+                    f"{message}"
+                    f"[/]"
+                )
 
         # Limpieza al terminar
         proc.stdout.close()
@@ -127,16 +138,16 @@ class APEventCollector(threading.Thread):
         console.print("\n[bold]Deteniendo el colector de eventos...[/bold]")
         self.join(timeout=2) # Damos 2 segundos para que termine limpiamente
 
-class BaseCollector(ABC, threading.Thread):
+class BaseCollector(ABC, multiprocessing.Process):
     """
     Clase base: mantiene cola, evento de parada y constructor común.
     No implementa run(), se deja a las subclases.
     """
     def __init__(self, interval: float = 1.0):
         super().__init__(daemon=True)
-        self.queue = queue.Queue()
+        self.queue = multiprocessing.Queue()
         self.interval = interval
-        self._stop_event = threading.Event()
+        self._stop_event = multiprocessing.Event()
         self.proc: Optional[subprocess.Popen] = None
 
     @abstractmethod
@@ -147,9 +158,9 @@ class BaseCollector(ABC, threading.Thread):
         raise NotImplementedError
 
     def stop(self) -> None:
-        """Detiene el proceso y el hilo."""
+        """Detiene el subproceso y el proceso principal."""
         if self.proc and self.proc.poll() is None:
-            console.print(f"[warn]Deteniendo {self.__class__.__name__}...[/warn]")
+            console.print(f"[warn]Deteniendo subproceso de {self.__class__.__name__}...[/warn]")
             # Enviar SIGINT al grupo de procesos
             if hasattr(subprocess.os, 'killpg'):
                 subprocess.os.killpg(subprocess.os.getpgid(self.proc.pid), signal.SIGINT)
@@ -169,16 +180,16 @@ class BaseCollector(ABC, threading.Thread):
         y luego drena la cola para devolver el más reciente.
         """
         try:
-            # 1) bloqueante: espera hasta timeout (o indefinido) por el primer dato
+            # 1) bloqueante: espera hasta timeout por el primer dato
             latest_item = self.queue.get_nowait()
-        except queue.Empty:
+        except Empty:
             return None
 
         # 2) drena todo lo que quede, quedándote con el último
         while True:
             try:
                 latest_item = self.queue.get_nowait()
-            except queue.Empty:
+            except Empty:
                 break
 
         return latest_item
@@ -190,7 +201,7 @@ class BaseCollector(ABC, threading.Thread):
         try:
             while True:
                 self.queue.get_nowait()
-        except queue.Empty:
+        except Empty:
             pass
 
 
@@ -199,7 +210,6 @@ class RSSICollector(BaseCollector):
     Colector continuo de RSSI y MAC usando un bucle de shell.
     Cada bloque de salida de 'iwconfig' se parsea a medida que llega.
     """
-
     def __init__(self, interface: str, interval: float = 1.0):
         super().__init__(interval)
         self.interface = interface
@@ -302,7 +312,6 @@ class LatencyCollector(BaseCollector):
     """
     Colector continuo de latencia usando 'ping -i'.
     """
-
     def __init__(self, interface: str, target_ip: str, interval: float = 1.0):
         super().__init__(interval)
         self.interface = interface
@@ -311,11 +320,8 @@ class LatencyCollector(BaseCollector):
     def run(self) -> None:
         interface_name = 'lo' if self.target_ip == '127.0.0.1' else self.interface
         cmd = [
-            'ping',
-            '-I', interface_name,
-            '-i', str(self.interval),
-            '-s', '1400',
-            self.target_ip
+            'ping', '-I', interface_name, '-i', str(self.interval),
+            '-s', '1400', self.target_ip
         ]
         popen_kwargs = {
             'stdout': subprocess.PIPE,
@@ -336,22 +342,18 @@ class LatencyCollector(BaseCollector):
         for line in iter(self.proc.stdout.readline, ''):
             if self._stop_event.is_set():
                 break
-            # Ejemplo de línea: "64 bytes from 1.2.3.4: icmp_seq=1 ttl=64 time=12.3 ms"
             m = re.search(r"time=([\d.]+)\s*ms", line)
             if m:
-                latency = float(m.group(1))
-                self.queue.put(latency)
+                self.queue.put(float(m.group(1)))
 
         self.proc.stdout.close()
-        console.print(f"[warn]{self.__class__.__name__} finalizado.[/warn]")
-
+        console.print(f"[warn]Proceso {self.__class__.__name__} finalizado.[/warn]")
 
 
 class Iperf3Collector(BaseCollector):
     """
-    Ejecuta un cliente iperf3 y recolecta jitter y pérdida de paquetes.
+    Ejecuta un cliente iperf y recolecta jitter y pérdida de paquetes.
     """
-
     def __init__(
         self,
         interface: str,
@@ -363,33 +365,30 @@ class Iperf3Collector(BaseCollector):
         self.interface = interface
         self.target_ip = target_ip
         self.port = port
-        self.proc: Optional[subprocess.Popen] = None
 
     def _parse_line(self, line: str) -> Optional[Tuple[float, float]]:
-        """Parse a single iperf3 UDP statistics line."""
+        """Parse a single iperf UDP statistics line."""
         if '0.00 bits/sec' in line:
             return None
-
         m = re.search(r"([\d\.]+)\s+ms\s+\d+/\d+\s+\(([0-9.eE+-]+)%\)", line)
         if not m:
             return None
-
         jitter = float(m.group(1))
         loss = float(m.group(2))
-        if loss > 50:
-            console.print(
-                f"[info] {datetime.now()} Jitter: {jitter:.3f} ms, Pérdida: {loss:.2f}%[/info]"
-            )
-
-        # luego lo muestras o lo guardas como prefieras
         return jitter, loss
 
     def run(self) -> None:
-        """
-        Sobrescribe el método run para gestionar el proceso iperf3.
-        El hilo se dedica a leer la salida del subproceso.
-        """
-        # Si el target es localhost, fuerza interfaz 'lo'
+        """Gestiona el proceso iperf y lee su salida."""
+        def get_interface_ip(iface: str) -> str:
+            try:
+                addrs = netifaces.ifaddresses(iface)
+                return addrs[netifaces.AF_INET][0]['addr']
+            except (KeyError, IndexError):
+                console.print(f"[error]No se pudo obtener la IP para la interfaz {iface}.[/error]")
+                return '127.0.0.1'
+
+        src_ip = get_interface_ip(self.interface)
+        self.target_ip = src_ip if self.target_ip == '127.0.0.1' else self.target_ip
         interface_name = 'lo' if self.target_ip == '127.0.0.1' else self.interface
         cmd = [
             'iperf3',
@@ -404,19 +403,16 @@ class Iperf3Collector(BaseCollector):
         console.print(f"Lanzando: {' '.join(cmd)}")
 
         popen_kwargs = {
-            'stdout': subprocess.PIPE,
-            'stderr': subprocess.STDOUT,
-            'text': True,
-            'bufsize': 1
+            'stdout': subprocess.PIPE, 'stderr': subprocess.STDOUT,
+            'text': True, 'bufsize': 1
         }
-        # preexec_fn permite matar el proceso y sus hijos fácilmente
         if hasattr(subprocess.os, 'setsid'):
             popen_kwargs['preexec_fn'] = subprocess.os.setsid
 
         try:
             self.proc = subprocess.Popen(cmd, **popen_kwargs)
         except FileNotFoundError:
-            console.print("[error]Comando 'iperf3' no encontrado.[/error]")
+            console.print("[error]Comando 'iperf' no encontrado.[/error]")
             self._stop_event.set()
             return
 
@@ -428,30 +424,13 @@ class Iperf3Collector(BaseCollector):
                 self.queue.put(stats)
         
         self.proc.stdout.close()
-        console.print("[warn]Hilo lector de iperf3 finalizado.[/warn]")
-
-    def stop(self) -> None:
-        """Envía SIGINT para una parada limpia de iperf3."""
-        if self.proc and self.proc.poll() is None:
-            console.print("[warn]Deteniendo iperf3...[/warn]")
-            # Enviar la señal al grupo de procesos para asegurar que iperf3 la recibe
-            if hasattr(subprocess.os, 'killpg'):
-                subprocess.os.killpg(subprocess.os.getpgid(self.proc.pid), signal.SIGINT)
-            else:
-                self.proc.send_signal(signal.SIGINT)
-            try:
-                self.proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                console.print("[error]iperf3 no respondió. Forzando kill.[/error]")
-                self.proc.kill()
-        super().stop()
+        console.print(f"[warn]Proceso lector de iperf finalizado.[/warn]")
 
 
 class DataCollector(BaseCollector):
     """
-    Orquesta múltiples colectores de métricas para producir muestras unificadas.
+    Orquesta múltiples colectores para producir muestras unificadas.
     """
-
     def __init__(
         self,
         interface: str,
@@ -460,45 +439,26 @@ class DataCollector(BaseCollector):
         log_file: Optional[str] = None
     ):
         super().__init__(interval)
+        mgr = multiprocessing.Manager()
         self.start_time = datetime.now()
-        self.sample_queue: queue.Queue[Sample] = self.queue  # Renombramos por claridad
-        self.ap_changes: list[APChange] = []
+        self.sample_queue: multiprocessing.Queue[Sample] = self.queue
+        self.summary_queue = multiprocessing.Queue() # Para devolver el resultado final
+        self.ap_changes: list[APChange] = mgr.list()
         self._current_ap_mac: Optional[str] = None
         self.all_samples: List[Sample] = []
         self.interface = interface
         self.log_file = log_file
-        self.event_queue: queue.Queue = queue.Queue()
 
-        # Instanciar colectores individuales
         self.rssi = RSSICollector(interface, interval)
         self.lat = LatencyCollector(interface, target_ip, interval) if target_ip else None
         self.ipf = Iperf3Collector(interface, target_ip, interval=interval) if target_ip else None
-        self.ap_event = APEventCollector(interface, self.event_queue)
+        # Colector de resultados de escaneo Wi-Fi cada 15 s
+        self.ap_event = APEventCollector(interface)
 
-        self.collectors = [
-            c for c in [self.rssi, self.lat, self.ipf, self.ap_event]
-            if c is not None
-        ]
-
-        self.executor = ThreadPoolExecutor(max_workers=len(self.collectors))
-        self._event_printer_thread = threading.Thread(target=self._event_printer, daemon=True)
-
-    
-    def _event_printer(self) -> None:
-        """
-        Hilo que imprime cada evento tan pronto como llegue al canal.
-        """
-        while not self._stop_event.is_set():
-            try:
-                ev = self.event_queue.get()
-            except queue.Empty:
-                continue
-            ts_fmt = ev["ts"].strftime("%H:%M:%S.%f")[:-3]
-            msg   = ev["msg"]
-            console.print(f"[timestamp]{ts_fmt}[/]  | [warn]{msg}[/]")
+        self.collectors = [c for c in [self.rssi, self.lat, self.ipf, self.ap_event] if c is not None]
 
     def _log_and_print(self, sample: Sample) -> None:
-        """Imprime cada muestra formateada, igual que hacías en RealTimePlot."""
+        """Imprime cada muestra formateada y la escribe en el log."""
         ts_fmt = sample.timestamp.strftime("%H:%M:%S.%f")[:-3]
         elapsed = f"{sample.elapsed:.3f} s"
         delta = (sample.elapsed - self._last_elapsed) if hasattr(self, "_last_elapsed") else elapsed
@@ -519,7 +479,7 @@ class DataCollector(BaseCollector):
 
         if self.log_file:
             write_log_line(self.log_file, self.interface, sample)
-
+    
     def flush_all_queues(self) -> None:
         # La propia DataCollector hereda BaseCollector, así que vacía su queue...
         self.flush_queue()
@@ -528,14 +488,10 @@ class DataCollector(BaseCollector):
             if isinstance(c, BaseCollector):
                 c.flush_queue()
 
-
     def run(self) -> None:
-        """
-        Método requerido por BaseCollector.
-        Ejecuta el ciclo de agregación de muestras.
-        """
-        self.flush_all_queues()  # Vaciamos las colas al inicio para evitar datos antiguos
+        """Ejecuta el ciclo de agregación de muestras."""
         time.sleep(self.interval * 1.5)
+        self.flush_all_queues()  # Vaciamos las colas al inicio para evitar datos antiguos
         while not self._stop_event.is_set():
             sample = self.collect_metric()
             if sample:
@@ -543,18 +499,18 @@ class DataCollector(BaseCollector):
                 self.all_samples.append(sample)
                 self.sample_queue.put(sample)
             time.sleep(self.interval)
-        else:
-            console.print("[warn]Hilo de recolección detenido.[/warn]")
+        
+        console.print("[warn]Proceso de recolección detenido. Enviando resumen...[/warn]")
+        self.summary_queue.put(self.all_samples) # Enviar datos al proceso padre
 
     def start(self) -> None:
-        """Inicia todos los hilos de recolección."""
+        """Inicia todos los procesos de recolección."""
         console.print(f"\nMonitorización Wi-Fi iniciada en [info]'{self.rssi.interface}'[/info]")
         console.print(f"Target: [info]{self.lat.target_ip if self.lat else 'N/A'}[/info]\n")
 
         for collector in self.collectors:
             collector.start()
-        super().start() # Inicia el hilo de agregación de DataCollector
-        self._event_printer_thread.start()  # Inicia el hilo de impresión de eventos
+        super().start() # Inicia el proceso de agregación de DataCollector
 
         header = (
             f"[timestamp]{'Hora':<14}[/timestamp]| "
@@ -570,97 +526,66 @@ class DataCollector(BaseCollector):
         console.print("-" * 104)
         
     def stop(self) -> None:
-        """Detiene todos los hilos de recolección."""
-        super().stop() # Detiene el hilo de agregación
+        """Detiene todos los procesos de recolección."""
         for collector in self.collectors:
             collector.stop()
-        self.executor.shutdown(wait=True)
-        time.sleep(0.5)  # Espera a que se detenga el hilo de muestreo
-        self.print_summary()  # Muestra el resumen final
+        super().stop() # Detiene el proceso de agregación (setea evento y hace join)
+        time.sleep(0.5)
+        self.print_summary()
 
     def _check_ap_change(self, ap_mac: str, elapsed: float) -> None:
-        """
-        Registra cambios de AP (incluye desconexión "Desconectado" ↔ AP real),
-        pero ignora la primera conexión al inicio.
-        """
-        # 1) Si es la primera vez (_current_ap_mac es None), sólo inicializa
+        """Registra cambios de AP."""
         if self._current_ap_mac is None:
             self._current_ap_mac = ap_mac
             return
-
-        # 2) Si cambia realmente, lo registras
         if ap_mac != self._current_ap_mac:
-            self.ap_changes.append(APChange(time=elapsed, name=ap_mac))
+            change = APChange(time=elapsed, name=ap_mac)
+            self.ap_changes.append(change)
             console.print(f"[warn]Cambio de AP -> {ap_mac}[/warn]")
             self._current_ap_mac = ap_mac
 
     def collect_metric(self) -> Optional[Sample]:
-        """
-        Agrega las últimas métricas de cada colector en un único Sample,
-        lanzando las llamadas en paralelo.
-        """
-        # Lanzamos todas las tareas simultáneamente
-        futures = {
-            'rssi':    self.executor.submit(self.rssi.get_latest),
-        }
-        if self.lat:
-            futures['latency'] = self.executor.submit(self.lat.get_latest)
-        if self.ipf:
-            futures['ipf']     = self.executor.submit(self.ipf.get_latest)
-
-        # 1) RSSI
-        rssi_tuple = futures['rssi'].result()
+        """Agrega las últimas métricas de cada colector en un único Sample."""
+        rssi_tuple = self.rssi.get_latest()
         if rssi_tuple:
             rssi, mac = rssi_tuple
             got_new_rssi = True
         else:
-            rssi = None
-            mac = self._current_ap_mac or ""
-            got_new_rssi = False
+            rssi, mac, got_new_rssi = None, self._current_ap_mac or "", False
 
-        # 2) Latencia
-        latency = futures.get('latency').result() if 'latency' in futures else None
+        latency = self.lat.get_latest() if self.lat else None
+        ipf_data = self.ipf.get_latest() if self.ipf else None
+        jitter, loss = ipf_data if ipf_data is not None else (None, None)
 
-        # 3) Iperf3 (jitter y pérdida)
-        ipf_data = futures.get('ipf').result() if 'ipf' in futures else None
-        if ipf_data is not None:
-            jitter, loss = ipf_data
-        else:
-            jitter, loss = None, None
-
-        # 4) Timestamps
-        now     = datetime.now()
+        now = datetime.now()
         elapsed = (now - self.start_time).total_seconds()
 
-        # 5) Cambio de AP si hay nuevo MAC
         if got_new_rssi:
             ap_mac_str = mac if mac else "Desconectado"
             self._check_ap_change(ap_mac_str, elapsed)
 
-        # 6) Nombre del AP
         ap_name = AP_MAP.get(mac, {}).get('name', mac) or 'Desconectado'
 
-        # 7) Mostrar sample
         return Sample(
-            timestamp=now,
-            elapsed=elapsed,
-            rssi=rssi,
-            ap_mac=mac,
-            ap_name=ap_name,
-            latency=latency,
-            jitter=jitter,
-            loss=loss
+            timestamp=now, elapsed=elapsed, rssi=rssi, ap_mac=mac,
+            ap_name=ap_name, latency=latency, jitter=jitter, loss=loss
         )
     
     def print_summary(self) -> None:
         """Muestra un resumen con las medias de las métricas en una tabla."""
-        if not self.all_samples:
+        try:
+            all_samples = self.summary_queue.get(timeout=5)
+        except Empty:
+            console.print("[error]No se recibieron datos para el resumen.[/error]")
+            all_samples = []
+
+        if not all_samples:
             console.print("[invalid]No hay datos para calcular medias.[/]")
             return
 
         metrics: Dict[str, Optional[float]] = {}
         for key in PLOT_CONFIG:
-            vals = [getattr(s, key) for s in self.all_samples if getattr(s, key) is not None]
+            vals = [getattr(s, key) for s in all_samples if getattr(s, key) is not None]
             metrics[key] = (sum(vals) / len(vals)) if vals else None
 
         table = Table(title="Resumen de la sesión")

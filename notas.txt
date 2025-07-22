@@ -29,3 +29,15 @@ Alfa 3 va raro, parece que necesita el bluetooth para funcionar.
 Alfa 1 parece que tiene un valor de bgscan distinto por defecto, aunque ha cambiado al reiniciar el equipo.
 Con Alfa 3 el iperf parece fallar de vez en cuando, no se a que se debe.
 He disminuido el timeout de la cola porque puede causar falsos tiempos.
+
+18 julio
+
+He cambiado iperf3 por iperf2 porque se puede configurar un intervalo más pequeño.
+También he cambiado threadding por multiprocessing para usar paralelismo real.
+
+20 julio
+He cambiado la manera de obtener el rssi para hacerlo más rápido y eficiente.
+
+21 julio
+He movido el codigo con multiprocessing a un nuevo fichero.
+Las alfa con -120 parece ser la unica situacion en la que aparecen bss transition
