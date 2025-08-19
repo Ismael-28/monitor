@@ -1,138 +1,143 @@
-import subprocess
-import signal
-from datetime import datetime
-from multiprocessing import Process
-import time
-from rich.console import Console # Usamos rich directamente para el ejemplo
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Script para procesar múltiples ficheros CSV de monitorización Wi-Fi.
+Recorre todo un directorio, agrupa ficheros por nombres similares y muestra las medias de fichero y de grupo.
+Usa Rich para salida estilizada.
+"""
 
-# --- Configuración de la consola de rich ---
-# Si tienes tu propio módulo 'theme', puedes seguir usándolo.
-# Para que este script sea autoejecutable, defino la consola aquí.
-console = Console(highlight=False)
+import os
+import glob
+import json
+import re
+import argparse
+import pandas as pd
+from rich.console import Console
+from rich.table import Table
+from rich.rule import Rule
+from rich.panel import Panel
+from rich.align import Align
 
-class APEventCollector(Process):
+console = Console()
+
+
+def find_csv_files(directory: str) -> list:
     """
-    Se suscribe a `iw event -t` para una interfaz específica y reporta
-    eventos de escaneo, conexión y desconexión con doble timestamp.
+    Busca todos los ficheros CSV en `directory`.
     """
-    def __init__(self, interface: str):
-        super().__init__(daemon=True)
-        self.interface = interface
-        self._stop_event = False
-        self.start_time = None # Para registrar el tiempo de inicio
+    pattern = os.path.join(directory, "*.csv")
+    return sorted(glob.glob(pattern))
 
-    def run(self):
-        # Registramos el momento exacto en que el proceso comienza a ejecutarse
-        self.start_time = time.monotonic()
-        
-        cmd = ['iw', 'event', '-t']
-        try:
-            # preexec_fn es para Linux/macOS. En Windows no se usa.
-            # Permite matar el proceso 'iw' de forma limpia.
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                text=True, preexec_fn=subprocess.os.setsid
-            )
-        except (FileNotFoundError, AttributeError):
-            console.print(f"[bold red]Error: El comando 'iw' no se encontró o el sistema no es compatible.[/bold red]")
-            return
 
-        for raw_line in proc.stdout:
-            if self._stop_event:
+def parse_csv_file(filepath: str):
+    """
+    Lee el CSV con metadatos y devuelve:
+      - df: DataFrame con los datos numéricos
+      - events: lista de eventos con mensajes
+    """
+    metadata = {}
+    with open(filepath, 'r', encoding='utf-8-sig') as f:
+        line = f.readline().strip()
+        if line != "#METADATA_START":
+            raise ValueError(f"{filepath} no tiene bloque METADATA_START")
+        while True:
+            line = f.readline().strip()
+            if line == "#METADATA_END":
                 break
+            if line.startswith("#"):
+                key, val = line[1:].split(',', 1)
+                metadata[key] = val
+        df = pd.read_csv(f)
 
-            line = raw_line.strip()
+    events = json.loads(metadata.get('Event_list_JSON', '[]'))
+    return df, events
 
-            # 1. Filtramos las líneas que no pertenecen a nuestra interfaz
-            if not self.interface in line:
-                continue
 
-            # 2. Extraemos el timestamp del comando 'iw'
-            try:
-                t_iw_str, rest = line.split(':', 1)
-                # El timestamp de 'iw' a veces viene con el nombre de la interfaz, lo limpiamos
-                t_iw_str = t_iw_str.split()[-1]
-                ts_iw = datetime.fromtimestamp(float(t_iw_str))
-            except (ValueError, IndexError):
-                continue # Si la línea no tiene el formato esperado, la ignoramos
+def compute_file_means(df: pd.DataFrame) -> dict:
+    """
+    Calcula la media de todas las columnas numéricas del DataFrame.
+    """
+    return df.select_dtypes(include=['number']).mean().round(3).to_dict()
 
-            # Calculamos el tiempo transcurrido desde que se inició el programa
-            elapsed_seconds = time.monotonic() - self.start_time
-            
-            rest = rest.strip()
-            message = ""
-            style = "white"
 
-            # 3. Identificamos los eventos de interés
-            if "scan started" in rest:
-                message = "SCAN INICIADO"
-                style = "cyan"
-            elif "scan finished" in rest:
-                message = "SCAN FINALIZADO"
-                style = "cyan"
-            elif "disconnected" in rest:
-                try:
-                    # Extrae BSSID tras 'disconnected'
-                    message = f"ESTACIÓN DESCONECTADA"
-                    style = "bold red"
-                except IndexError:
-                    continue
-            elif "connected" in rest:
-                try:
-                    # Formato: connect XX:XX:XX:XX:XX:XX auth_type ...
-                    bssid = rest.split("connected")[-1].strip().split()[1]
-                    message = f"ESTACIÓN CONECTADA → {bssid}"
-                    style = "bold green"
-                except IndexError:
-                    continue
-            elif "del station" in rest:
-                try:
-                     # Formato: del station XX:XX:XX:XX:XX:XX
-                    bssid = rest.split("del station")[-1].strip().split()[0]
-                    message = f"ESTACIÓN BORRADA   → {bssid}"
-                    style = "yellow"
-                except IndexError:
-                    continue
+def compute_durations(events: list, keyword: str) -> list:
+    """
+    Extrae valores de duración (en ms) de eventos cuyo mensaje contenga `keyword`.
+    """
+    durations = []
+    pattern = re.compile(rf"{keyword}: ([\d\.]+) ms")
+    for ev in events:
+        msg = ev.get('msg', '')
+        m = pattern.search(msg)
+        if m:
+            durations.append(float(m.group(1)))
+    return durations
 
-            # Si hemos identificado un evento, lo mostramos
-            if message:
-                console.print(
-                    f"[{style}]"
-                    f"[dim]+{elapsed_seconds:08.3f}s[/dim] " # Timestamp del programa
-                    f"[{ts_iw:%H:%M:%S.%f}] " # Timestamp de 'iw'
-                    f"{message}"
-                    f"[/]"
-                )
 
-        # Limpieza al terminar
-        proc.stdout.close()
+def main():
+    parser = argparse.ArgumentParser(
+        description="Agrupa CSV de monitorización por nombre y muestra medias individuales y globales"
+    )
+    parser.add_argument('directory', help='Directorio con los ficheros CSV')
+    args = parser.parse_args()
+
+    files = find_csv_files(args.directory)
+    if not files:
+        console.print(f"[red]No se encontraron CSV en {args.directory}[/]")
+        return
+
+    console.print(Rule("Procesando CSV en directorio", style="green"))
+    records = []
+    for path in files:
+        filename = os.path.basename(path)
+        console.print(f"- Leyendo [bold cyan]{filename}[/]")
         try:
-            # Matamos el grupo de procesos para asegurar que 'iw' termine
-            subprocess.os.killpg(subprocess.os.getpgid(proc.pid), signal.SIGINT)
-        except Exception:
-            pass
+            df, events = parse_csv_file(path)
+        except Exception as e:
+            console.print(f"[red]Error leyendo {filename}: {e}[/]")
+            continue
+        means = compute_file_means(df)
+        roam = compute_durations(events, 'Tiempo reconexión')
+        scan = compute_durations(events, 'Duración escaneo')
+        means['Roaming(ms)'] = round(sum(roam)/len(roam),3) if roam else None
+        means['Escaneo(ms)'] = round(sum(scan)/len(scan),3) if scan else None
+        record = {'Archivo': filename}
+        record.update(means)
+        records.append(record)
 
-    def stop(self):
-        """Marca la señal de parada y espera a que el proceso hijo termine."""
-        self._stop_event = True
-        console.print("\n[bold]Deteniendo el colector de eventos...[/bold]")
-        self.join(timeout=2) # Damos 2 segundos para que termine limpiamente
+    if not records:
+        console.print("[yellow]No hay datos válidos para procesar.[/]")
+        return
 
+    # DataFrame con medias por fichero
+    df_summary = pd.DataFrame(records)
+    # Extraer nombre sin extensión
+    df_summary['FilenameNoExt'] = df_summary['Archivo'].str[:-4]
+    # Quitar la parte de timestamp (tras último '_')
+    df_summary['Base'] = df_summary['FilenameNoExt'].str.rsplit('_', n=1).str[0]
+    # Quitar el sufijo de ejecución (tras último '-') para definir grupo
+    df_summary['Grupo'] = df_summary['Base'].str.rsplit('-', n=1).str[0]
 
-if __name__ == "__main__":
-    # IMPORTANTE: Reemplaza "wlp0s20f3" con el nombre de tu interfaz Wi-Fi
-    INTERFACE_WIFI = "wlp0s20f3" 
-    
-    collector = APEventCollector(INTERFACE_WIFI)
-    console.print(f"[bold]Iniciando monitor de eventos para la interfaz [magenta]{INTERFACE_WIFI}[/magenta]...[/bold]")
-    console.print("[dim]Presiona Ctrl+C para detener.[/dim]")
-    collector.start()
-    
-    try:
-        # Mantenemos el programa principal vivo mientras el proceso hijo trabaja
-        while collector.is_alive():
-            time.sleep(0.5)
-    except KeyboardInterrupt:
-        collector.stop()
-    
-    console.print("[bold]Programa finalizado.[/bold]")
+    # Mostrar resultados por grupo: tabla por grupo con fila final de medias
+    for grupo, subdf in df_summary.groupby('Grupo'):
+        console.print(Rule(f"Grupo: {grupo}", style="magenta"))
+        # Columnas a mostrar
+        cols = ['Archivo'] + [c for c in subdf.columns if c not in ['Archivo','FilenameNoExt','Base','Grupo']]
+        table = Table(show_header=True, header_style="bold cyan")
+        for col in cols:
+            justify = 'left' if col == 'Archivo' else 'right'
+            table.add_column(col, justify=justify)
+        # Filas por fichero
+        for _, row in subdf.iterrows():
+            table.add_row(*[str(row[col]) if pd.notna(row[col]) else '-' for col in cols])
+        # Fila de medias del grupo
+        table.add_section()
+        media = subdf.drop(columns=['Archivo','FilenameNoExt','Base','Grupo']).mean(numeric_only=True).round(3)
+        mean_vals = ['Media'] + [str(media[c]) for c in cols if c != 'Archivo']
+        table.add_row(*mean_vals, style="bold yellow")
+        # Centrar la tabla en el panel usando Align.center
+        console.print(Align.center(table))
+
+        
+if __name__ == '__main__':
+    main()

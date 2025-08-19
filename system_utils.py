@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import List, Optional, Tuple
 from rich.console import Console
 
-from utils import get_interface_display_name
+from utils import build_filepath, get_interface_display_name
 
 console = Console()
 
@@ -82,13 +82,14 @@ def get_wifi_interfaces_list(mode_filter: Optional[str] = None) -> List[str]:
 
 def start_tshark_capture(capture_interface: str, monitored_interface: str, name: Optional[str]) -> Tuple[Optional[subprocess.Popen], Optional[str]]:
     """Inicia una captura de tshark en segundo plano."""
-    base_dir = "capturas"
-    iface_dir = os.path.join(base_dir, get_interface_display_name(capture_interface))
-    os.makedirs(iface_dir, exist_ok=True)
-
-    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    suffix = f"{name}" if name else ""
-    pcap_filename = os.path.join(iface_dir, f"captura_{capture_interface}_{monitored_interface}_{suffix}_{timestamp}.pcap")
+    pcap_filename = build_filepath(
+        category='capturas',
+        interface=capture_interface,
+        name=name,
+        timestamp=datetime.now(),
+        prefix=f"captura_{monitored_interface}",
+        extension='pcap'
+    )
 
     display = get_interface_display_name(capture_interface)
     console.print(

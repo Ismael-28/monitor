@@ -1,9 +1,12 @@
+import inspect
 import os
 import json
+from adjustText import adjust_text
 from datetime import datetime
 from typing import List, Optional, Tuple, Dict, Any
 from queue import Empty
 
+from matplotlib.lines import Line2D
 import pandas as pd
 from rich.table import Table
 
@@ -21,10 +24,10 @@ except ImportError as e:
     console.print(f"[yellow]Advertencia: no se pudo importar Matplotlib ({e}). Las funciones de graficación están desactivadas.[/yellow]")
     MATPLOTLIB_AVAILABLE = False
 
-from config import AP_MAP, PLOT_CONFIG
+from config import APS, PLOT_CONFIG, APEventType
 from data_collector import DataCollector
-from utils import format_stat, get_interface_display_name, write_log_line
-from models import Sample, APChange
+from utils import build_filepath, get_interface_display_name, write_log_line
+from models import Sample, StatusUpdate
 from theme import console
 
 
@@ -70,49 +73,45 @@ def _setup_plot_axes(fig: Figure) -> Dict[str, Axes]:
     return axes_map
 
 
-def _draw_ap_change_annotations(ax: Axes, ap_changes: List[APChange]):
-    # NO borres nada aquí, porque solo dibujarás cada cambio una vez
-    y_min, y_max = ax.get_ylim()
-    text_y = y_min + (y_max - y_min) * 0.05
-    offset = (ax.get_xlim()[1] - ax.get_xlim()[0]) * 0.01  # 1% del ancho de la gráfica
-    for change in ap_changes:
-        # Detectamos desconexiones (puedes cambiar la condición según tu modelo)
-        is_disconnect = 'desconect' in change.name.lower()
-        line_color = 'orange' if is_disconnect else 'red'
-        box_color  = 'darkorange' if is_disconnect else 'red'
-        if is_disconnect:
-            text_x = change.time - offset
-            ha = 'right'
-        else:
-            text_x = change.time + offset
-            ha = 'left' 
-
-        # Línea vertical
+def _draw_status_change_annotations(ax: Axes, status_changes: List[StatusUpdate]):
+    for change in status_changes:
         ax.axvline(
             x=change.time,
-            color=line_color,
+            color=change.event_type.color,
             linestyle='--',
             linewidth=1.5,
             zorder=0
         )
-        # Etiqueta con fondo diferenciado si es desconexión
-        ax.text(
-            text_x,
-            text_y,
-            change.name,
-            color='white',
-            rotation=90,
-            ha=ha,
-            va='bottom',
-            fontsize=9,
-            bbox=dict(
-                boxstyle='round',
-                fc=box_color,
-                alpha=0.7,
-                ec='none'
-            ),
-            zorder=10
+
+
+def add_ap_event_legend(fig):
+    """
+    Añade una leyenda en la parte inferior de la figura,
+    con un handle por cada tipo de evento definido en APEventType.
+    """
+    # Generamos un proxy artist (Line2D) para cada evento
+    handles = [
+        Line2D(
+            [], [],
+            color=evt.color,
+            linestyle='--',
+            linewidth=1.5,
+            label=evt.message
         )
+        for evt in APEventType
+    ]
+
+    fig.legend(
+        handles=handles,
+        loc='lower center',
+        ncol=len(handles),
+        facecolor='darkslategray',
+        edgecolor='white',
+        labelcolor='white',
+        fontsize=10,
+        framealpha=0.7,
+        bbox_to_anchor=(0.5, 0.02)
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -122,7 +121,7 @@ def _draw_ap_change_annotations(ax: Axes, ap_changes: List[APChange]):
 def generate_final_plot(
     interface: str,
     samples: List[Sample],
-    ap_changes: List[APChange],
+    status_changes: List[StatusUpdate],
     start_time_str: str,
     figsize: Tuple[int,int],
 ) -> Optional[Figure]:
@@ -160,12 +159,12 @@ def generate_final_plot(
 
     for mac, data in rssi_data_per_ap.items():
         if not data['x']: continue
-        cfg = AP_MAP.get(mac, {})
+        cfg = APS.get(mac, {})
         ax_rssi.plot(
             data['x'], data['y'],
             color=cfg.get("color", "gray"),
-            linestyle='-' if mac in AP_MAP else ':',
-            marker='.' if mac in AP_MAP else 'x',
+            linestyle='-' if mac in APS else ':',
+            marker='.' if mac in APS else 'x',
             markersize=4,
             label=cfg.get("name", f"AP Desc ({mac})")
         )
@@ -188,7 +187,7 @@ def generate_final_plot(
 
     # --- Ajuste final de ejes y leyendas ---
     for ax_key, ax in axes.items():
-        _draw_ap_change_annotations(ax, ap_changes)
+        _draw_status_change_annotations(ax, status_changes)
         ax.relim()
         ax.autoscale_view()
         handles, labels = ax.get_legend_handles_labels()
@@ -199,6 +198,9 @@ def generate_final_plot(
                 handles, labels, loc='upper right', facecolor='darkslategray',
                 edgecolor=edge_color, labelcolor='white'
             )
+
+    # --- Leyenda central para los tipos de anotación ---
+    add_ap_event_legend(fig)
 
     axes['ax_loss'].set_ylim(bottom=-10, top=100)
     return fig
@@ -228,7 +230,7 @@ class RealTimePlot:
         self.plot_data: Dict[str, Dict] = {}
         self.artists: List[Any] = []
         self.collector = DataCollector(interface=interface, target_ip=target, interval=interval, log_file=log_file)
-        self._drawn_ap_changes = 0
+        self._drawn_status_changes = 0
 
         self._initialize_plot()
 
@@ -243,7 +245,7 @@ class RealTimePlot:
         self.axes = _setup_plot_axes(self.fig)
 
         self.plot_data['rssi_lines'] = {}
-        for mac, cfg in AP_MAP.items():
+        for mac, cfg in APS.items():
             line, = self.axes['ax_rssi'].plot(
                 [], [], color=cfg['color'], linestyle='-', marker='.', markersize=4, label=cfg['name']
             )
@@ -315,15 +317,15 @@ class RealTimePlot:
             ax.relim()
             ax.autoscale_view(scalex=False)
 
-        # aquí solo si hay nuevos APChange
-        changes = self.collector.ap_changes
-        if len(changes) > self._drawn_ap_changes:
+        # aquí solo si hay nuevos cambios
+        changes = self.collector.status_changes
+        if len(changes) > self._drawn_status_changes:
             # tomamos solo los que aún no hemos dibujado
-            new_changes = changes[self._drawn_ap_changes:]
+            new_changes = changes[self._drawn_status_changes:]
             for ax in self.axes.values():
-                _draw_ap_change_annotations(ax, new_changes)
+                _draw_status_change_annotations(ax, new_changes)
             # actualizamos contador
-            self._drawn_ap_changes = len(changes)
+            self._drawn_status_changes = len(changes)
 
 
     def _update_frame(self, frame_num: int) -> List[Any]:
@@ -382,24 +384,25 @@ class RealTimePlot:
     def save_plot_image(self, new_size: Optional[Tuple[int,int]] = None) -> bool:
         """Guarda la gráfica final como un fichero de imagen PNG."""
         fig_to_save = generate_final_plot(
-            self.interface, self.samples, self.collector.ap_changes,
+            self.interface, self.samples, self.collector.status_changes,
             self.start_time_str, new_size or self.figsize,
         )
         if not fig_to_save:
             console.print("[error]No hay datos para generar la imagen.[/error]")
             return False
 
-        base_dir = "graficas"
-        iface_dir = os.path.join(base_dir, get_interface_display_name(self.interface))
-        os.makedirs(iface_dir, exist_ok=True)
-        
-        filename = os.path.join(
-            iface_dir,
-            f"grafica_{self.interface}_{self.name}_{self.start_time.strftime('%Y-%m-%d_%H-%M-%S')}.png"
+        filepath = build_filepath(
+            category="graficas",
+            interface=self.interface,
+            name=self.name,
+            timestamp=self.start_time,
+            prefix='grafica',
+            extension='png'
         )
+        
         try:
-            fig_to_save.savefig(filename, facecolor='darkslategray', bbox_inches='tight', dpi=150)
-            console.print(f"[success]Imagen guardada en:[/] {os.path.abspath(filename)}")
+            fig_to_save.savefig(filepath, facecolor='darkslategray', bbox_inches='tight', dpi=150)
+            console.print(f"[success]Imagen guardada en:[/] {os.path.abspath(filepath)}")
             plt.close(fig_to_save)
             return True
         except Exception as e:
@@ -411,15 +414,21 @@ class RealTimePlot:
         if not self.samples:
             console.print("[yellow]No hay muestras para guardar en CSV.[/yellow]")
             return False
+        
+        events_json = json.dumps(
+            [{'ts': ev.ts, 'msg': ev.msg} for ev in self.collector.event_list],
+            ensure_ascii=False,
+        )
 
         metadata = {
             'Interface': self.interface,
             'Start_Time': self.start_time_str,
             'Ping_Target': self.target,
-            'AP_Map_JSON': json.dumps(AP_MAP),
-            'AP_Changes_JSON': json.dumps([
-                {'time': c.time, 'name': c.name} for c in self.collector.ap_changes
+            'AP_Map_JSON': json.dumps(APS),
+            'Status_Changes_JSON': json.dumps([
+                {'time': c.time, 'name': c.name} for c in self.collector.status_changes
             ]),
+            'Event_list_JSON': events_json
         }
 
         rows = [{
@@ -434,12 +443,13 @@ class RealTimePlot:
         } for s in self.samples]
         df = pd.DataFrame(rows)
 
-        base_dir = "datos_graficas"
-        iface_dir = os.path.join(base_dir, get_interface_display_name(self.interface))
-        os.makedirs(iface_dir, exist_ok=True)
-        filename = os.path.join(
-            iface_dir,
-            f"datos_{self.interface}_{self.name}_{self.start_time.strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+        filepath = build_filepath(
+            category="datos_graficas",
+            interface=self.interface,
+            name=self.name,
+            timestamp=self.start_time,
+            prefix='datos',
+            extension='csv'
         )
 
         try:
@@ -453,15 +463,177 @@ class RealTimePlot:
             }])
             df = pd.concat([df, mean_row], ignore_index=True)
 
-            with open(filename, 'w', newline='', encoding='utf-8') as f:
+            with open(filepath, 'w', newline='', encoding='utf-8-sig') as f:
                 f.write("#METADATA_START\n")
                 for key, val in metadata.items():
                     f.write(f"#{key},{val}\n")
-                f.write("#METADATA_END\n")
-                df.to_csv(f, index=False)
 
-            console.print(f"[success]CSV guardado en:[/] {os.path.abspath(filename)}")
+                f.write("#METADATA_END\n")
+                df.to_csv(f, index=False, encoding='utf-8-sig')
+
+            console.print(f"[success]CSV guardado en:[/] {os.path.abspath(filepath)}")
             return True
         except Exception as e:
             console.print(f"[error]Error guardando CSV: {e}[/]")
             return False
+
+def generate_single_metric_plot(
+    metric_key: str,
+    interface: str,
+    samples: List[Sample],
+    status_changes: List[StatusUpdate],
+    start_time_str: str,
+    figsize: Tuple[int,int]
+) -> Optional[Figure]:
+    """
+    Genera una figura con sólo la gráfica de `metric_key`.
+    metric_key debe ser una clave de PLOT_CONFIG: 'rssi','latency','jitter' o 'loss'.
+    """
+    if not samples:
+        return None
+
+    cfg = PLOT_CONFIG.get(metric_key)
+    if cfg is None:
+        raise ValueError(f"Métrica desconocida: {metric_key}")
+
+    fig = plt.figure(figsize=figsize)
+    display = get_interface_display_name(interface)
+    fig.suptitle(
+        f"{cfg.title}: Monitor Wi‑Fi {display} ({interface})\nInicio: {start_time_str}",
+        fontsize=14, color='white', weight='bold'
+    )
+
+    # Eje único
+    ax = fig.add_subplot(1,1,1)
+    # reutiliza tu función de estilo
+    style_axis(ax, cfg.title, cfg.ylabel, cfg.color)
+
+    # Extraer datos
+    xs = [s.elapsed for s in samples]
+    ys = [getattr(s, metric_key) for s in samples]
+
+    # Dibuja línea
+    ax.plot(
+        xs, ys,
+        color=cfg.color,
+        linestyle='-',
+        marker='.',
+        markersize=4,
+        label=cfg.title
+    )
+
+    # Anota cambios de estado
+    _draw_status_change_annotations(ax, status_changes)
+
+    ax.relim()
+    ax.autoscale_view()
+    ax.legend(
+        loc='upper right',
+        facecolor='darkslategray',
+        edgecolor=cfg.legend_edge_color,
+        labelcolor='white'
+    )
+
+    return fig
+
+
+# ——— Modificación de create_graph_from_csv ———————————————————————————————————————
+
+def create_graph_from_csv(
+    csv_filepath: str,
+    output_dir: str = "graficas_csv",
+    figsize: Tuple[int, int] = (50, 14),
+    metric: Optional[str] = None      # <-- clave opcional: 'rssi', 'latency', 'jitter' o 'loss'
+) -> bool:
+    """
+    Lee un fichero CSV con metadatos, reconstruye la sesión y genera:
+      - Si metric is None: la figura completa de 4 subplots.
+      - Si metric es una clave válida: sólo esa gráfica.
+
+    Args:
+        csv_filepath (str): Ruta al CSV.
+        output_dir (str): Directorio de salida.
+        figsize (Tuple[int,int]): Tamaño de la figura.
+        metric (Optional[str]): Métrica a graficar ('rssi','latency','jitter','loss').
+    """
+    console.print(f"\n[info]Procesando fichero:[/] {csv_filepath}")
+    if not os.path.exists(csv_filepath):
+        console.print(f"[error]El fichero no existe: {csv_filepath}[/]")
+        return False
+
+    try:
+        # --- 1. Leer metadatos y DataFrame
+        metadata = {}
+        with open(csv_filepath, 'r', encoding='utf-8-sig') as f:
+            if f.readline().strip() != "#METADATA_START":
+                raise ValueError("Falta cabecera #METADATA_START")
+            while (line := f.readline().strip()) != "#METADATA_END":
+                if line.startswith("#"):
+                    k, v = line[1:].split(',',1)
+                    metadata[k] = v
+            df = pd.read_csv(f, skipfooter=1, engine='python')
+
+        interface      = metadata.get('Interface','desconocida')
+        start_time_str = metadata.get('Start_Time','N/A')
+
+        # --- 2. Reconstruir cambios de estado y muestras
+        status_changes_json = json.loads(metadata.get('Status_Changes_JSON','[]'))
+        status_changes = [ StatusUpdate.parse_status_change_entry(c) for c in status_changes_json ]
+
+        samples: List[Sample] = []
+        for row in df.to_dict('records'):
+            samples.append(Sample(
+                timestamp=datetime.strptime(row['Timestamp'], "%Y-%m-%d %H:%M:%S.%f"),
+                elapsed=float(row['Segundos']),
+                rssi=(float(row['RSSI(dBm)']) if pd.notna(row['RSSI(dBm)']) else None),
+                ap_mac=(row['AP_MAC']   if pd.notna(row['AP_MAC'])   else None),
+                ap_name=(row['AP_Nombre']if pd.notna(row['AP_Nombre'])else "Desconectado"),
+                latency=(float(row['Latencia(ms)']) if pd.notna(row['Latencia(ms)']) else None),
+                jitter=(float(row['Jitter(ms)'])    if pd.notna(row['Jitter(ms)'])    else None),
+                loss=(float(row['Perdida(%)'])     if pd.notna(row['Perdida(%)'])     else None),
+            ))
+
+        console.print(f"[info]Leídas {len(samples)} muestras y {len(status_changes)} eventos.[/info]")
+
+        # --- 3. Generar figura
+        if metric:
+            fig_to_save = generate_single_metric_plot(
+                metric_key=metric,
+                interface=interface,
+                samples=samples,
+                status_changes=status_changes,
+                start_time_str=start_time_str,
+                figsize=figsize
+            )
+        else:
+            fig_to_save = generate_final_plot(
+                interface=interface,
+                samples=samples,
+                status_changes=status_changes,
+                start_time_str=start_time_str,
+                figsize=figsize
+            )
+
+        if not fig_to_save:
+            console.print("[error]No hay datos para generar la figura.[/error]")
+            return False
+
+        # --- 4. Guardar imagen
+        iface_dir = os.path.join(output_dir, get_interface_display_name(interface))
+        os.makedirs(iface_dir, exist_ok=True)
+        base = os.path.splitext(os.path.basename(csv_filepath))[0]
+        suf   = f"_{metric}" if metric else "_recreada"
+        outfn = os.path.join(iface_dir, f"{base}{suf}.png")
+
+        fig_to_save.savefig(
+            outfn, facecolor='darkslategray',
+            bbox_inches='tight', dpi=250
+        )
+        plt.close(fig_to_save)
+        console.print(f"[success]Imagen guardada en:[/] {os.path.abspath(outfn)}")
+        return True
+
+    except Exception as e:
+        console.print(f"[error]Al procesar CSV: {e}[/]")
+        import traceback; traceback.print_exc()
+        return False

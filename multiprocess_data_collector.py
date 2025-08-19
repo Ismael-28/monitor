@@ -25,9 +25,9 @@ from rich.table import Table
 from typing import Any, Dict, List, Optional, Tuple
 
 # Asumimos que estos módulos existen en tu proyecto
-from models import APChange, Sample
+from models import StatusUpdate, Sample
 from theme import console
-from config import AP_MAP, PLOT_CONFIG
+from config import APS, PLOT_CONFIG
 from utils import format_stat, write_log_line
 
 class APEventCollector(multiprocessing.Process):
@@ -443,7 +443,7 @@ class DataCollector(BaseCollector):
         self.start_time = datetime.now()
         self.sample_queue: multiprocessing.Queue[Sample] = self.queue
         self.summary_queue = multiprocessing.Queue() # Para devolver el resultado final
-        self.ap_changes: list[APChange] = mgr.list()
+        self.ap_changes: list[StatusUpdate] = mgr.list()
         self._current_ap_mac: Optional[str] = None
         self.all_samples: List[Sample] = []
         self.interface = interface
@@ -539,7 +539,7 @@ class DataCollector(BaseCollector):
             self._current_ap_mac = ap_mac
             return
         if ap_mac != self._current_ap_mac:
-            change = APChange(time=elapsed, name=ap_mac)
+            change = StatusUpdate(time=elapsed, name=ap_mac)
             self.ap_changes.append(change)
             console.print(f"[warn]Cambio de AP -> {ap_mac}[/warn]")
             self._current_ap_mac = ap_mac
@@ -564,7 +564,7 @@ class DataCollector(BaseCollector):
             ap_mac_str = mac if mac else "Desconectado"
             self._check_ap_change(ap_mac_str, elapsed)
 
-        ap_name = AP_MAP.get(mac, {}).get('name', mac) or 'Desconectado'
+        ap_name = APS.get(mac, {}).get('name', mac) or 'Desconectado'
 
         return Sample(
             timestamp=now, elapsed=elapsed, rssi=rssi, ap_mac=mac,

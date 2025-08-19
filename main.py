@@ -13,7 +13,7 @@ import time
 from datetime import datetime
 from typing import Optional
 import typer
-from utils import get_interface_display_name
+from utils import build_filepath, get_interface_display_name
 from theme import console
 import system_utils
 import ui
@@ -24,14 +24,14 @@ app = typer.Typer(add_completion=False)
 
 def setup_logging(interface_name: str, name: Optional[str]) -> Optional[object]:
     """Configura y abre el archivo de log si es necesario."""
-    base_dir = "logs"
-    iface_dir = os.path.join(base_dir, get_interface_display_name(interface_name))
-    os.makedirs(iface_dir, exist_ok=True)
-
-    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    suffix = name or ""
-
-    log_filename = os.path.join(iface_dir, f"mon_{interface_name}_{suffix}_{timestamp}.log")
+    log_filename = build_filepath(
+        category='logs',
+        interface=interface_name,
+        name=name,
+        timestamp=datetime.now(),
+        prefix='mon',
+        extension='log'
+    )
     try:
         log_file = open(log_filename, 'w', encoding='utf-8')
         console.print(f"Guardando log en: {log_filename}")

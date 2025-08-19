@@ -6,22 +6,50 @@ Almacena constantes y configuraciones globales para la aplicación,
 como el mapa de puntos de acceso conocidos.
 """
 
-from typing import Dict
-from models import PlotConfig
+from dataclasses import dataclass
+from enum import Enum
+from typing import Dict, Optional
+
+class APEventType(Enum):
+    SCAN_STARTED   = ("Escaneo iniciado",   "wheat")
+    SCAN_ABORTED   = ("Escaneo abortado",   "aquamarine")
+    SCAN_FINISHED  = ("Escaneo finalizado", "plum")
+    DISCONNECTED   = ("Desconectado",       "orange")
+    CONNECTED      = ("Conectado",          "red")
+
+    def __init__(self, message: str, color: str):
+        self.message = message
+        self.color = color
+
+    def format(self, info: Optional[str] = None) -> str:
+        return f"{self.message} -> {info}" if info else self.message
 
 
-AP_MAP = {
+APS = {
     "30:DE:4B:D2:69:7B": {"name": "Nodo 1", "color": "cyan"},
     "30:DE:4B:D2:61:47": {"name": "Nodo 2", "color": "lime"},
     "30:DE:4B:D2:63:67": {"name": "Nodo 3", "color": "fuchsia"},
 }
 
-INTERFACE_MAP: Dict[str, str] = {
+INTERFACES: Dict[str, str] = {
     "wlp0s20f3": "Intel",
+    "wlp0s20f3mon": "Intel",
     "wlx00c0cab2bc1a": "Alfa_1",
+    "wlx00c0cab2bc1amon": "Alfa_1",
     "wlx00c0cab2bc2c": "Alfa_2",
+    "wlx00c0cab2bc2cmon": "Alfa_2",
     "wlx00c0cab3c2de": "Alfa_3",
+    "wlx00c0cab3c2demon": "Alfa_3",
 }
+
+@dataclass
+class PlotConfig:
+    ax_key: str
+    title: str
+    ylabel: str
+    color: str
+    legend_edge_color: str
+    current_title: Optional[str] = None
 
 PLOT_CONFIG: Dict[str, PlotConfig] = {
     'rssi': PlotConfig(

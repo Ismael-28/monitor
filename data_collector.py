@@ -20,35 +20,50 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from rich.table import Table
 from typing import Any, Dict, List, Optional, Tuple
-from models import APChange, Sample
+from models import StatusUpdate, Sample, Event
 from theme import console
-from config import AP_MAP, PLOT_CONFIG
-from utils import format_stat, write_log_line
+from config import APS, PLOT_CONFIG, APEventType
+from utils import format_stat, get_ap_display_name, write_log_line
 
 class APEventCollector(threading.Thread):
     """
-    Se suscribe a `iw event -t` para una interfaz específica y reporta
-    eventos de escaneo, conexión y desconexión con doble timestamp.
+    Se suscribe a `iw event -t` y publica en event_queue:
+      - ESCANEO INICIADO / ESCANEO FINALIZADO
+      - ESTACIÓN DESCONECTADA / ESTACIÓN CONECTADA -> BSSID
+      - ESTACIÓN BORRADA   -> BSSID
+      - DURACIÓN ESCANEO: XX ms
+      - TIEMPO RECONEXIÓN: XX ms
     """
-    def __init__(self, interface: str, event_queue: queue.Queue):
+    def __init__(
+            self,
+            interface: str,
+            event_queue: queue.Queue[Event],
+            status_updates: list[StatusUpdate],
+            start_time: datetime
+        ):
         super().__init__(daemon=True)
         self.interface = interface
-        self._stop_event = False
         self.event_queue = event_queue
+        self.status_updates   = status_updates
+        self.start_time   = start_time
+        self._stop_event = False
+
+        # Tiempos para cálculo de duraciones
+        self._scan_start_ts = None
+        self._del_station_ts = None
 
     def run(self):
-        # Registramos el momento exacto en que el proceso comienza a ejecutarse
-        
         cmd = ['iw', 'event', '-t']
         try:
-            # preexec_fn es para Linux/macOS. En Windows no se usa.
-            # Permite matar el proceso 'iw' de forma limpia.
             proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                text=True, preexec_fn=subprocess.os.setsid
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                preexec_fn=subprocess.os.setsid
             )
         except (FileNotFoundError, AttributeError):
-            console.print(f"[bold red]Error: El comando 'iw' no se encontró o el sistema no es compatible.[/bold red]")
+            console.print("[error]Error: comando 'iw' no encontrado o sistema no compatible[/error]")
             return
 
         for raw_line in proc.stdout:
@@ -56,76 +71,96 @@ class APEventCollector(threading.Thread):
                 break
 
             line = raw_line.strip()
-
-            # 1. Filtramos las líneas que no pertenecen a nuestra interfaz
-            if not self.interface in line:
+            if self.interface not in line:
                 continue
 
-            # 2. Extraemos el timestamp del comando 'iw'
+            # extraer timestamp de 'iw'
             try:
                 t_iw_str, rest = line.split(':', 1)
-                # El timestamp de 'iw' a veces viene con el nombre de la interfaz, lo limpiamos
                 t_iw_str = t_iw_str.split()[-1]
                 ts_iw = datetime.fromtimestamp(float(t_iw_str))
             except (ValueError, IndexError):
-                continue # Si la línea no tiene el formato esperado, la ignoramos
-            
-            rest = rest.strip()
-            message = ""
-            style = "white"
+                continue
 
-            # 3. Identificamos los eventos de interés
+            rest = rest.strip().lower()
+            elapsed = (ts_iw - self.start_time).total_seconds()
+
             if "scan started" in rest:
-                message = "SCAN INICIADO"
-                style = "cyan"
+                self.event_queue.put(Event(ts_iw, "Escaneo iniciado"))
+                self.status_updates.append(StatusUpdate(
+                    time=elapsed,
+                    event_type=APEventType.SCAN_STARTED
+                ))
+                self._scan_start_ts = ts_iw
+
+            if "scan aborted" in rest:
+                self.event_queue.put(Event(ts_iw, "Escaneo abortado"))
+                self.status_updates.append(StatusUpdate(
+                    time=elapsed,
+                    event_type=APEventType.SCAN_ABORTED
+                ))
+                if self._scan_start_ts:
+                    dur = (ts_iw - self._scan_start_ts).total_seconds() * 1000
+                    # evento extra con duración en ms
+                    self.event_queue.put(Event(ts_iw, f"Duración escaneo: {dur:.3f} ms"))
+                    self._scan_start_ts = None
+                    
             elif "scan finished" in rest:
-                message = "SCAN FINALIZADO"
-                style = "cyan"
+                self.event_queue.put(Event(ts_iw, "Escaneo finalizado"))
+                self.status_updates.append(StatusUpdate(
+                    time=elapsed,
+                    event_type=APEventType.SCAN_FINISHED
+                ))
+                if self._scan_start_ts:
+                    dur = (ts_iw - self._scan_start_ts).total_seconds() * 1000
+                    # evento extra con duración en ms
+                    self.event_queue.put(Event(ts_iw, f"Duración escaneo: {dur:.3f} ms"))
+                    self._scan_start_ts = None
+
             elif "disconnected" in rest:
-                try:
-                    # Extrae BSSID tras 'disconnected'
-                    message = f"ESTACIÓN DESCONECTADA"
-                    style = "bold red"
-                except IndexError:
-                    continue
-            elif "connected" in rest:
-                try:
-                    # Formato: connect XX:XX:XX:XX:XX:XX auth_type ...
-                    bssid = rest.split("connected")[-1].strip().split()[1]
-                    message = f"ESTACIÓN CONECTADA -> {bssid}"
-                    style = "bold green"
-                except IndexError:
-                    continue
+                self.event_queue.put(Event(ts_iw, "Estación desconectada"))
+                self.status_updates.append(StatusUpdate(
+                    time=elapsed,
+                    event_type=APEventType.DISCONNECTED
+                ))
+
             elif "del station" in rest:
-                try:
-                     # Formato: del station XX:XX:XX:XX:XX:XX
-                    bssid = rest.split("del station")[-1].strip().split()[0]
-                    message = f"ESTACIÓN BORRADA   -> {bssid}"
-                    style = "yellow"
-                except IndexError:
-                    continue
+                # Formato: del station XX:XX:XX:XX:XX:XX
+                parts = rest.split()
+                if len(parts) >= 3:
+                    bssid = parts[3].upper()
+                    ap_name = get_ap_display_name(bssid)
+                    self.event_queue.put(Event(ts_iw, f"Estación borrada -> {ap_name}"))
+                    self._del_station_ts = ts_iw
 
-            # Si hemos identificado un evento, lo mostramos
-            tiemstamp = ts_iw.strftime("%H:%M:%S.%f")[:-3]  # Formato HH:MM:SS.sss
-            if message:
-                self.event_queue.put({
-                    "ts": ts_iw,
-                    "msg": message
-                })
+            elif "connected" in rest:
+                # Formato: connect XX:XX:XX:XX:XX:XX auth_type...
+                parts = rest.split()
+                if len(parts) >= 5:
+                    bssid = parts[5].upper()
+                    ap_name = get_ap_display_name(bssid)
+                    self.event_queue.put(Event(ts_iw, f"Estación conectada -> {ap_name}"))
+                    # registro conexión
+                    self.status_updates.append(StatusUpdate(
+                        time=elapsed,
+                        event_type=APEventType.CONNECTED,
+                        info=ap_name
+                    ))
+                    if self._del_station_ts:
+                        recon = (ts_iw - self._del_station_ts).total_seconds() * 1000
+                        self.event_queue.put(Event(ts_iw, f"Tiempo reconexión: {recon:.3f} ms"))
+                        self._del_station_ts = None
 
-        # Limpieza al terminar
         proc.stdout.close()
         try:
-            # Matamos el grupo de procesos para asegurar que 'iw' termine
             subprocess.os.killpg(subprocess.os.getpgid(proc.pid), signal.SIGINT)
         except Exception:
             pass
 
     def stop(self):
-        """Marca la señal de parada y espera a que el proceso hijo termine."""
         self._stop_event = True
-        console.print("\n[bold]Deteniendo el colector de eventos...[/bold]")
-        self.join(timeout=2) # Damos 2 segundos para que termine limpiamente
+        console.print("\n[bold]Deteniendo colector de eventos...[/bold]")
+        self.join(timeout=2)
 
 class BaseCollector(ABC, threading.Thread):
     """
@@ -197,7 +232,7 @@ class BaseCollector(ABC, threading.Thread):
 class RSSICollector(BaseCollector):
     """
     Colector continuo de RSSI y MAC usando un bucle de shell.
-    Cada bloque de salida de 'iwconfig' se parsea a medida que llega.
+    Cada bloque de salida de 'iw' se parsea a medida que llega.
     """
 
     def __init__(self, interface: str, interval: float = 1.0):
@@ -302,11 +337,19 @@ class LatencyCollector(BaseCollector):
     """
     Colector continuo de latencia usando 'ping -i'.
     """
+    LATENCY_THRESHOLD_MS = 150
 
-    def __init__(self, interface: str, target_ip: str, interval: float = 1.0):
+    def __init__(
+        self,
+        interface: str,
+        target_ip: str,
+        event_queue: queue.Queue[Event],
+        interval: float = 1.0
+    ):
         super().__init__(interval)
         self.interface = interface
         self.target_ip = target_ip
+        self.event_queue = event_queue
 
     def run(self) -> None:
         interface_name = 'lo' if self.target_ip == '127.0.0.1' else self.interface
@@ -341,6 +384,13 @@ class LatencyCollector(BaseCollector):
             if m:
                 latency = float(m.group(1))
                 self.queue.put(latency)
+                if latency > self.LATENCY_THRESHOLD_MS:
+                    self.event_queue.put(
+                        Event(
+                            datetime.now(),
+                            f"Latencia alta: {latency:.3f} ms"
+                        )
+                    )
 
         self.proc.stdout.close()
         console.print(f"[warn]{self.__class__.__name__} finalizado.[/warn]")
@@ -354,6 +404,7 @@ class Iperf3Collector(BaseCollector):
 
     def __init__(
         self,
+        event_queue: queue.Queue[Event],
         interface: str,
         target_ip: str,
         port: int = 5201,
@@ -363,6 +414,7 @@ class Iperf3Collector(BaseCollector):
         self.interface = interface
         self.target_ip = target_ip
         self.port = port
+        self.event_queue = event_queue
         self.proc: Optional[subprocess.Popen] = None
 
     def _parse_line(self, line: str) -> Optional[Tuple[float, float]]:
@@ -376,10 +428,8 @@ class Iperf3Collector(BaseCollector):
 
         jitter = float(m.group(1))
         loss = float(m.group(2))
-        if loss > 50:
-            console.print(
-                f"[info] {datetime.now()} Jitter: {jitter:.3f} ms, Pérdida: {loss:.2f}%[/info]"
-            )
+        if loss > 30:
+            self.event_queue.put(Event(datetime.now(), f"Pérdida: {loss:.2f}%"))
 
         # luego lo muestras o lo guardas como prefieras
         return jitter, loss
@@ -462,18 +512,19 @@ class DataCollector(BaseCollector):
         super().__init__(interval)
         self.start_time = datetime.now()
         self.sample_queue: queue.Queue[Sample] = self.queue  # Renombramos por claridad
-        self.ap_changes: list[APChange] = []
+        self.status_changes: list[StatusUpdate] = []
         self._current_ap_mac: Optional[str] = None
         self.all_samples: List[Sample] = []
         self.interface = interface
         self.log_file = log_file
-        self.event_queue: queue.Queue = queue.Queue()
+        self.event_queue: queue.Queue[Event] = queue.Queue()
+        self.event_list: List[Event] = []
 
         # Instanciar colectores individuales
         self.rssi = RSSICollector(interface, interval)
-        self.lat = LatencyCollector(interface, target_ip, interval) if target_ip else None
-        self.ipf = Iperf3Collector(interface, target_ip, interval=interval) if target_ip else None
-        self.ap_event = APEventCollector(interface, self.event_queue)
+        self.lat = LatencyCollector(interface, target_ip, self.event_queue, interval) if target_ip else None
+        self.ipf = Iperf3Collector(self.event_queue, interface, target_ip, interval=interval) if target_ip else None
+        self.ap_event = APEventCollector(interface, self.event_queue, self.status_changes, self.start_time)
 
         self.collectors = [
             c for c in [self.rssi, self.lat, self.ipf, self.ap_event]
@@ -493,9 +544,8 @@ class DataCollector(BaseCollector):
                 ev = self.event_queue.get()
             except queue.Empty:
                 continue
-            ts_fmt = ev["ts"].strftime("%H:%M:%S.%f")[:-3]
-            msg   = ev["msg"]
-            console.print(f"[timestamp]{ts_fmt}[/]  | [warn]{msg}[/]")
+            self.event_list.append(ev)
+            console.print(f"[timestamp]{ev.ts}[/]  | [warn]{ev.msg}[/]")
 
     def _log_and_print(self, sample: Sample) -> None:
         """Imprime cada muestra formateada, igual que hacías en RealTimePlot."""
@@ -578,22 +628,6 @@ class DataCollector(BaseCollector):
         time.sleep(0.5)  # Espera a que se detenga el hilo de muestreo
         self.print_summary()  # Muestra el resumen final
 
-    def _check_ap_change(self, ap_mac: str, elapsed: float) -> None:
-        """
-        Registra cambios de AP (incluye desconexión "Desconectado" ↔ AP real),
-        pero ignora la primera conexión al inicio.
-        """
-        # 1) Si es la primera vez (_current_ap_mac es None), sólo inicializa
-        if self._current_ap_mac is None:
-            self._current_ap_mac = ap_mac
-            return
-
-        # 2) Si cambia realmente, lo registras
-        if ap_mac != self._current_ap_mac:
-            self.ap_changes.append(APChange(time=elapsed, name=ap_mac))
-            console.print(f"[warn]Cambio de AP -> {ap_mac}[/warn]")
-            self._current_ap_mac = ap_mac
-
     def collect_metric(self) -> Optional[Sample]:
         """
         Agrega las últimas métricas de cada colector en un único Sample,
@@ -633,12 +667,13 @@ class DataCollector(BaseCollector):
         elapsed = (now - self.start_time).total_seconds()
 
         # 5) Cambio de AP si hay nuevo MAC
-        if got_new_rssi:
-            ap_mac_str = mac if mac else "Desconectado"
-            self._check_ap_change(ap_mac_str, elapsed)
+        ap_mac_str = mac if mac else "Desconectado"
+
+        if ap_mac_str != self._current_ap_mac:
+            self._current_ap_mac = ap_mac_str
 
         # 6) Nombre del AP
-        ap_name = AP_MAP.get(mac, {}).get('name', mac) or 'Desconectado'
+        ap_name = get_ap_display_name(mac)
 
         # 7) Mostrar sample
         return Sample(
@@ -678,11 +713,11 @@ class DataCollector(BaseCollector):
 
         console.print(table)
 
-        if self.ap_changes:
-            changes_tbl = Table(title="Cambios de AP durante la sesión")
+        if self.status_changes:
+            changes_tbl = Table(title="Cambios de estado durante la sesión")
             changes_tbl.add_column("Tiempo (s)", style="bold", justify="right")
-            changes_tbl.add_column("Nuevo AP", style="bold")
-            for change in self.ap_changes:
+            changes_tbl.add_column("Cambios de estado", style="bold")
+            for change in self.status_changes:
                 changes_tbl.add_row(f"{change.time:.3f}", change.name)
             console.print(changes_tbl)
         else:
